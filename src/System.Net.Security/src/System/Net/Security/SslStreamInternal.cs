@@ -22,7 +22,7 @@ namespace System.Net.Security
 
         private const int PinnableReadBufferSize = 4096 * 4 + 32;         // We read in 16K chunks + headers.
         private static PinnableBufferCache s_PinnableReadBufferCache = new PinnableBufferCache("System.Net.SslStream", PinnableReadBufferSize);
-        
+
         private SslState _sslState;
         private int _nestedWrite;
         private int _nestedRead;
@@ -36,8 +36,7 @@ namespace System.Net.Security
         private int _internalBufferCount;
 
         byte[] outBuffer = s_PinnableReadBufferCache.AllocateBuffer();
-        byte[] secondBuffer = s_PinnableReadBufferCache.AllocateBuffer();
-
+        
         private int _decryptedBytesOffset;
         private int _decryptedBytesCount;
 
@@ -76,7 +75,6 @@ namespace System.Net.Security
                 FreeReadBuffer();
             }
             FreeBuffer(outBuffer);
-            FreeBuffer(secondBuffer);
             GC.SuppressFinalize(this);
         }
 
@@ -174,7 +172,7 @@ namespace System.Net.Security
         {
             _sslState.CheckThrow(authSuccessCheck: true, shutdownCheck: true);
             ValidateParameters(buffer, offset, count);
-            
+
             if (count < (PinnableReadBufferSize - 16 - 8 - 5))
             {
                 byte[] localBuffer = outBuffer;
@@ -193,7 +191,7 @@ namespace System.Net.Security
                 return WriteAsyncInternal(buffer, offset, count);
             }
 
-            
+
         }
 
         private async Task AwaitUnlock(Task task)
@@ -213,14 +211,9 @@ namespace System.Net.Security
 
         private async Task WriteAsyncInternal(byte[] buffer, int offset, int count)
         {
-            byte[] currentWriteBuffer = null;
-
-            var writeTask = Task.CompletedTask;
-
+            byte[] bufferused = outBuffer;
             while (count > 0)
             {
-                byte[] bufferused = outBuffer != currentWriteBuffer ? outBuffer : secondBuffer;
-
                 int encryptedBytes;
                 SecurityStatusPal status = _sslState.EncryptData(buffer, offset, count, ref bufferused, out encryptedBytes);
                 if (status.ErrorCode == SecurityStatusPalErrorCode.OK)
@@ -231,13 +224,9 @@ namespace System.Net.Security
                 {
                     ThrowEncryptionIOException(status);
                 }
-                
-                await writeTask;
-                currentWriteBuffer = bufferused;
-                writeTask = _sslState.InnerStream.WriteAsync(bufferused, 0, encryptedBytes);
-            }
 
-            await writeTask;
+                await writeTask = _sslState.InnerStream.WriteAsync(bufferused, 0, encryptedBytes);
+            }
         }
 
         private void ThrowEncryptionIOException(SecurityStatusPal status)
