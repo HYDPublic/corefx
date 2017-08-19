@@ -176,11 +176,7 @@ namespace System.Net.Security
         {
             _sslState.CheckThrow(authSuccessCheck: true, shutdownCheck: true);
             ValidateParameters(buffer, offset, count);
-            if (Interlocked.Exchange(ref _nestedWrite, 1) == 1)
-            {
-                ThrowNestedWriteNotSupportedException();
-            }
-
+            
             if (count < (PinnableWriteBufferSize - 16 - 8 - 5))
             {
                 byte[] localBuffer = outBuffer;
@@ -192,18 +188,7 @@ namespace System.Net.Security
                 }
 
                 var t = _sslState.InnerStream.WriteAsync(localBuffer, 0, encryptedBytes);
-                if (t.IsCompleted)
-                {
-                    if (Interlocked.Exchange(ref _nestedWrite, 0) == 0)
-                    {
-                        ThrowEndInvalidOperationNotSupportedException();
-                    }
-                    return t;
-                }
-                else
-                {
-                    return AwaitUnlock(t);
-                }
+                return t;
             }
             else
             {
@@ -258,12 +243,6 @@ namespace System.Net.Security
             }
 
             await writeTask;
-            if (Interlocked.Exchange(ref _nestedWrite, 0) == 0)
-            {
-                ThrowEndInvalidOperationNotSupportedException();
-            }
-
-
         }
 
         private void ThrowEncryptionIOException(SecurityStatusPal status)
