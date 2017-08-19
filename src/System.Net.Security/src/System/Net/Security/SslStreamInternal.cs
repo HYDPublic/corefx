@@ -7,6 +7,7 @@ using System.IO;
 using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Buffers;
 
 namespace System.Net.Security
 {
@@ -24,7 +25,6 @@ namespace System.Net.Security
         private const int PinnableReadBufferSize = 4096 * 4 + 32;         // We read in 16K chunks + headers.
         private static PinnableBufferCache s_PinnableReadBufferCache = new PinnableBufferCache("System.Net.SslStream", PinnableReadBufferSize);
         private const int PinnableWriteBufferSize = 4096 + 1024;        // We write in 4K chunks + encryption overhead.
-        private static PinnableBufferCache s_PinnableWriteBufferCache = new PinnableBufferCache("System.Net.SslStream", PinnableWriteBufferSize);
 
         private SslState _sslState;
         private int _nestedWrite;
@@ -170,43 +170,58 @@ namespace System.Net.Security
             return bufferResult.Int32Result;
         }
 
-        internal IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback asyncCallback, object asyncState)
+        internal async Task WriteAsync(byte[] buffer, int offset, int count)
         {
-            var lazyResult = new LazyAsyncResult(this, asyncState, asyncCallback);
-            ProcessWrite(buffer, offset, count, lazyResult);
-            return lazyResult;
-        }
+            _sslState.CheckThrow(authSuccessCheck: true, shutdownCheck: true);
+            ValidateParameters(buffer, offset, count);
 
-        internal void EndWrite(IAsyncResult asyncResult)
-        {
-            if (asyncResult == null)
+            if (Interlocked.Exchange(ref _nestedWrite, 1) == 1)
             {
-                throw new ArgumentNullException(nameof(asyncResult));
+                throw new NotSupportedException(SR.Format(SR.net_io_invalidnestedcall, "Write", "write"));
             }
-
-            LazyAsyncResult lazyResult = asyncResult as LazyAsyncResult;
-            if (lazyResult == null)
+            byte[] outBuffer = ArrayPool<byte>.Shared.Rent(PinnableWriteBufferSize);
+            try
             {
-                throw new ArgumentException(SR.Format(SR.net_io_async_result, asyncResult.GetType().FullName), nameof(asyncResult));
-            }
+                while (count > 0)
+                {
+                    int chunkBytes = Math.Min(count, _sslState.MaxDataSize);
+                    int encryptedBytes;
+                    SecurityStatusPal status = _sslState.EncryptData(buffer, offset, chunkBytes, ref outBuffer, out encryptedBytes);
+                    if (status.ErrorCode == SecurityStatusPalErrorCode.ContinueNeeded)
+                    {
+                        chunkBytes = 0;
+                    }
+                    else if (status.ErrorCode != SecurityStatusPalErrorCode.OK)
+                    {
+                        // Re-handshake status is not supported.
+                        ProtocolToken message = new ProtocolToken(null, status);
+                        throw new IOException(SR.net_io_encrypt, message.GetException());
+                    }
+                    await _sslState.InnerStream.WriteAsync(outBuffer, 0, encryptedBytes);
 
+                    offset += chunkBytes;
+                    count -= chunkBytes;
+                }
+            }
+            finally
+            {
+                FreeBuffer(outBuffer);
+            }
             if (Interlocked.Exchange(ref _nestedWrite, 0) == 0)
             {
                 throw new InvalidOperationException(SR.Format(SR.net_io_invalidendcall, "EndWrite"));
             }
+        }
 
-            // No "artificial" timeouts implemented so far, InnerStream controls timeout.
-            lazyResult.InternalWaitForCompletion();
+        internal IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback asyncCallback, object asyncState)
+        {
+            IAsyncResult ar = TaskToApm.Begin(WriteAsync(buffer, offset, count), asyncCallback, asyncState);
+            return ar;
+        }
 
-            if (lazyResult.Result is Exception e)
-            {
-                if (e is IOException)
-                {
-                    ExceptionDispatchInfo.Throw(e);
-                }
-
-                throw new IOException(SR.net_io_write, e);
-            }
+        internal void EndWrite(IAsyncResult asyncResult)
+        {
+            TaskToApm.End(asyncResult);
         }
 
         private byte[] InternalBuffer
@@ -386,7 +401,7 @@ namespace System.Net.Security
 
                     int chunkBytes = Math.Min(count, _sslState.MaxDataSize);
                     int encryptedBytes;
-                    byte[] outBuffer = s_PinnableWriteBufferCache.AllocateBuffer();
+                    byte[] outBuffer = ArrayPool<byte>.Shared.Rent(PinnableWriteBufferSize);
                     if (PinnableBufferCacheEventSource.Log.IsEnabled())
                     {
                         PinnableBufferCacheEventSource.Log.DebugMessage3("In System.Net._SslStream.StartWriting Using Pinnable", this.GetHashCode(), count, PinnableBufferCacheEventSource.AddressOfByteArray(outBuffer));
@@ -420,20 +435,13 @@ namespace System.Net.Security
                         // Prepare for the next request.
                         asyncRequest.SetNextRequest(buffer, offset + chunkBytes, count - chunkBytes, s_resumeAsyncWriteCallback);
                         Task t = _sslState.InnerStream.WriteAsync(outBuffer, 0, encryptedBytes).ContinueWith(_freeBufferAction, outBuffer);
-                        if (t.IsCompleted)
-                        {
-                            t.GetAwaiter().GetResult();
-                        }
-                        else
-                        {
-                            IAsyncResult ar = TaskToApm.Begin(t, s_writeCallback, asyncRequest);
-                            if (!ar.CompletedSynchronously)
-                            {
-                                return;
-                            }
-                            TaskToApm.End(ar);
-                        }
 
+                        IAsyncResult ar = TaskToApm.Begin(t, s_writeCallback, asyncRequest);
+                        if (!ar.CompletedSynchronously)
+                        {
+                            return;
+                        }
+                        TaskToApm.End(ar);
                     }
                     else
                     {
@@ -450,9 +458,6 @@ namespace System.Net.Security
                     offset += chunkBytes;
                     count -= chunkBytes;
 
-                    // Release write IO slot.
-                    _sslState.FinishWrite();
-
                 } while (count != 0);
 
             }
@@ -461,7 +466,9 @@ namespace System.Net.Security
 
         private void FreeBuffer(byte[] buffer)
         {
-            s_PinnableWriteBufferCache.FreeBuffer(buffer);
+            // Release write IO slot.
+            _sslState.FinishWrite();
+            ArrayPool<byte>.Shared.Return(buffer);
             if (PinnableBufferCacheEventSource.Log.IsEnabled())
             {
                 PinnableBufferCacheEventSource.Log.DebugMessage1("In System.Net._SslStream.StartWriting Freeing buffer.", this.GetHashCode());

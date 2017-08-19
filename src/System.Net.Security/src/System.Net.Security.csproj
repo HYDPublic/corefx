@@ -407,6 +407,7 @@
     <Reference Include="System.Threading" />
     <Reference Include="System.Threading.Tasks" />
     <Reference Include="System.Threading.ThreadPool" />
+    <Reference Include="System.Buffers" />
   </ItemGroup>
   <ItemGroup Condition="'$(TargetsUnix)' == 'true'">
     <Reference Include="System.Security.Cryptography.Algorithms" />
