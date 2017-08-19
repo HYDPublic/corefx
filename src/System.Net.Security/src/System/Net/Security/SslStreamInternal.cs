@@ -22,9 +22,7 @@ namespace System.Net.Security
 
         private const int PinnableReadBufferSize = 4096 * 4 + 32;         // We read in 16K chunks + headers.
         private static PinnableBufferCache s_PinnableReadBufferCache = new PinnableBufferCache("System.Net.SslStream", PinnableReadBufferSize);
-        private const int PinnableWriteBufferSize = 4096 + 1024;        // We write in 4K chunks + encryption overhead.
-        private static PinnableBufferCache s_PinnableWriterBufferCache = new PinnableBufferCache("System.Net.SslStream", PinnableWriteBufferSize);
-
+        
         private SslState _sslState;
         private int _nestedWrite;
         private int _nestedRead;
@@ -37,8 +35,8 @@ namespace System.Net.Security
         private int _internalOffset;
         private int _internalBufferCount;
 
-        byte[] outBuffer = s_PinnableWriterBufferCache.AllocateBuffer();
-        byte[] secondBuffer = s_PinnableWriterBufferCache.AllocateBuffer();
+        byte[] outBuffer = s_PinnableReadBufferCache.AllocateBuffer();
+        byte[] secondBuffer = s_PinnableReadBufferCache.AllocateBuffer();
 
         private int _decryptedBytesOffset;
         private int _decryptedBytesCount;
@@ -177,7 +175,7 @@ namespace System.Net.Security
             _sslState.CheckThrow(authSuccessCheck: true, shutdownCheck: true);
             ValidateParameters(buffer, offset, count);
             
-            if (count < (PinnableWriteBufferSize - 16 - 8 - 5))
+            if (count < (PinnableReadBufferSize - 16 - 8 - 5))
             {
                 byte[] localBuffer = outBuffer;
                 int encryptedBytes;
@@ -195,10 +193,7 @@ namespace System.Net.Security
                 return WriteAsyncInternal(buffer, offset, count);
             }
 
-            void ThrowNestedWriteNotSupportedException()
-            {
-                throw new NotSupportedException(SR.Format(SR.net_io_invalidnestedcall, "Write", "write"));
-            }
+            
         }
 
         private async Task AwaitUnlock(Task task)
@@ -379,7 +374,7 @@ namespace System.Net.Security
 
         private void FreeBuffer(byte[] buffer)
         {
-            s_PinnableWriterBufferCache.FreeBuffer(buffer);
+            s_PinnableReadBufferCache.FreeBuffer(buffer);
             if (PinnableBufferCacheEventSource.Log.IsEnabled())
             {
                 PinnableBufferCacheEventSource.Log.DebugMessage1("In System.Net._SslStream.StartWriting Freeing buffer.", this.GetHashCode());
