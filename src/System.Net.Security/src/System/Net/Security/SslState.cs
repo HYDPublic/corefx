@@ -477,6 +477,7 @@ namespace System.Net.Security
             {
                 Context.Close();
             }
+            SecureStream.Dispose();
         }
 
         internal SecurityStatusPal EncryptData(byte[] buffer, int offset, int count, ref byte[] outBuffer, out int outSize)
