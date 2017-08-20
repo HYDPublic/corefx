@@ -285,6 +285,11 @@ namespace System.Net.Security
                 this);
         #endregion
 
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            return _sslState.SecureStream.WriteAsync(buffer, offset, count);
+        }
+
         public override bool IsAuthenticated
         {
             get
