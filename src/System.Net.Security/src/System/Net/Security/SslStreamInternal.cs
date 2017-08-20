@@ -16,6 +16,7 @@ namespace System.Net.Security
     //
     internal class SslStreamInternal : IDisposable
     {
+        private static readonly Task s_CompletedTask = Task.CompletedTask;
         private static readonly AsyncProtocolCallback s_resumeAsyncReadCallback = new AsyncProtocolCallback(ResumeAsyncReadCallback);
         private static readonly AsyncProtocolCallback s_readHeaderCallback = new AsyncProtocolCallback(ReadHeaderCallback);
         private static readonly AsyncProtocolCallback s_readFrameCallback = new AsyncProtocolCallback(ReadFrameCallback);
@@ -173,6 +174,8 @@ namespace System.Net.Security
             _sslState.CheckThrow(authSuccessCheck: true, shutdownCheck: true);
             ValidateParameters(buffer, offset, count);
 
+            LockWrite();
+
             if (count < (PinnableReadBufferSize - 16 - 8 - 5))
             {
                 byte[] localBuffer = outBuffer;
@@ -183,39 +186,42 @@ namespace System.Net.Security
                     ThrowEncryptionIOException(status);
                 }
 
-                var t = _sslState.InnerStream.WriteAsync(localBuffer, 0, encryptedBytes);
-                return t;
+                var task = _sslState.InnerStream.WriteAsync(localBuffer, 0, encryptedBytes);
+                if (!task.IsCompletedSuccessfully)
+                {
+                    return AwaitAndUnlockWrite(task);
+                }
+
+                task.GetAwaiter().GetResult();
+                UnlockWrite();
+
+                return s_CompletedTask;
             }
             else
             {
-                return WriteAsyncInternal(buffer, offset, count);
+                return WriteAsyncAwaited(buffer, offset, count);
             }
 
-
-        }
-
-        private async Task AwaitUnlock(Task task)
-        {
-            try
+            async Task AwaitAndUnlockWrite(Task writeTask)
             {
-                await task;
-            }
-            finally
-            {
-                if (Interlocked.Exchange(ref _nestedWrite, 0) == 0)
+                try
                 {
-                    ThrowEndInvalidOperationNotSupportedException();
+                    await writeTask;
+                }
+                finally
+                {
+                    UnlockWrite();
                 }
             }
         }
 
-        private async Task WriteAsyncInternal(byte[] buffer, int offset, int count)
+        private async Task WriteAsyncAwaited(byte[] buffer, int offset, int count)
         {
             byte[] bufferused = outBuffer;
             while (count > 0)
             {
-                int encryptedBytes;
-                SecurityStatusPal status = _sslState.EncryptData(buffer, offset, count, ref bufferused, out encryptedBytes);
+                SecurityStatusPal status =
+                    _sslState.EncryptData(buffer, offset, count, ref bufferused, out var encryptedBytes);
                 if (status.ErrorCode == SecurityStatusPalErrorCode.OK)
                 {
                     count = 0;
@@ -225,25 +231,48 @@ namespace System.Net.Security
                     ThrowEncryptionIOException(status);
                 }
 
-                await writeTask = _sslState.InnerStream.WriteAsync(bufferused, 0, encryptedBytes);
+                await _sslState.InnerStream.WriteAsync(bufferused, 0, encryptedBytes);
+            }
+
+            UnlockWrite();
+        }
+
+        private void LockWrite()
+        {
+            if (Interlocked.Exchange(ref _nestedWrite, 1) == 1)
+            {
+                ThrowNestedWritesNotSupportedException();
+            }
+
+            void ThrowNestedWritesNotSupportedException()
+            {
+                throw new NotSupportedException(SR.Format(SR.net_io_invalidnestedcall, "Write", "write"));
             }
         }
 
-        private void ThrowEncryptionIOException(SecurityStatusPal status)
+        private void UnlockWrite()
         {
-            throw GetEncryptionIOException(status);
+            if (Interlocked.Exchange(ref _nestedWrite, 0) == 0)
+            {
+                ThrowEndInvalidOperationNotSupportedException();
+            }
+
+            void ThrowEndInvalidOperationNotSupportedException()
+            {
+                throw new InvalidOperationException(SR.Format(SR.net_io_invalidendcall, "EndWrite"));
+            }
         }
 
-        private IOException GetEncryptionIOException(SecurityStatusPal status)
+        private void ThrowEncryptionIOException(SecurityStatusPal securityStatus)
         {
-            // Re-handshake status is not supported.
-            ProtocolToken message = new ProtocolToken(null, status);
-            return new IOException(SR.net_io_encrypt, message.GetException());
-        }
+            throw GetEncryptionIOException(securityStatus);
 
-        private void ThrowEndInvalidOperationNotSupportedException()
-        {
-            throw new InvalidOperationException(SR.Format(SR.net_io_invalidendcall, "EndWrite"));
+            IOException GetEncryptionIOException(SecurityStatusPal status)
+            {
+                // Re-handshake status is not supported.
+                ProtocolToken message = new ProtocolToken(null, status);
+                return new IOException(SR.net_io_encrypt, message.GetException());
+            }
         }
 
         internal IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback asyncCallback, object asyncState)
